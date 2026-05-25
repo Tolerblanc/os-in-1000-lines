@@ -12,6 +12,11 @@ struct sbiret {
 #define PAGE_X    (1 << 3)   // 실행 가능
 #define PAGE_U    (1 << 4)   // 사용자 모드 접근 가능
 
+// 애플리케이션 이미지의 기본 가상 주소입니다. 이는 `user.ld`에 정의된 시작 주소와 일치해야 합니다.
+#define USER_BASE 0x1000000
+
+#define SSTATUS_SPIE (1 << 5)
+
 #define PANIC(fmt, ...)                                                        \
     do {                                                                       \
         printf("PANIC: %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);  \
