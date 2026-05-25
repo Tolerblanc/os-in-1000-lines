@@ -29,6 +29,8 @@ struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
     return (struct sbiret){.error = a0, .value = a1};
 }
 
+
+
 extern char __free_ram[], __free_ram_end[];
 
 paddr_t alloc_pages(uint32_t n) {
@@ -47,6 +49,26 @@ void putchar(char ch) {
     sbi_call(ch, 0, 0, 0, 0, 0, 0, 1);
 }
 
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+    if (!is_aligned(vaddr, PAGE_SIZE))
+        PANIC("unaligned vaddr %x", vaddr);
+
+    if (!is_aligned(paddr, PAGE_SIZE))
+        PANIC("unaligned paddr %x", paddr);
+
+    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
+    if ((table1[vpn1] & PAGE_V) == 0) {
+        // 1단계 페이지 테이블 엔트리가 존재하지 않으면 2단계 페이지 테이블을 생성합니다.
+        uint32_t pt_paddr = alloc_pages(1);
+        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+    }
+
+    // Set the 2nd level page table entry to map the physical page.
+    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
+    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+}
+
 #define PROCS_MAX 8       // 최대 프로세스 개수
 
 #define PROC_UNUSED   0   // 사용되지 않는 프로세스 구조체
@@ -56,8 +78,9 @@ struct process {
     int pid;             // 프로세스 ID
     int state;           // 프로세스 상태: PROC_UNUSED 또는 PROC_RUNNABLE
     vaddr_t sp;          // 스택 포인터
+    uint32_t *page_table;
     uint8_t stack[8192]; // 커널 스택
-}; 
+};
 
 __attribute__((naked)) void switch_context(uint32_t *prev_sp,
                                            uint32_t *next_sp) {
@@ -83,7 +106,7 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
         "lw sp, (a1)\n"         // sp를 다음 프로세스의 값으로 변경
 
         // 다음 프로세스 스택에서 callee-saved 레지스터 복원
-        "lw ra,  0  * 4(sp)\n"  
+        "lw ra,  0  * 4(sp)\n"
         "lw s0,  1  * 4(sp)\n"
         "lw s1,  2  * 4(sp)\n"
         "lw s2,  3  * 4(sp)\n"
@@ -96,12 +119,13 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
         "lw s9,  10 * 4(sp)\n"
         "lw s10, 11 * 4(sp)\n"
         "lw s11, 12 * 4(sp)\n"
-        "addi sp, sp, 13 * 4\n" 
+        "addi sp, sp, 13 * 4\n"
         "ret\n"
     );
 }
 
 struct process procs[PROCS_MAX]; // 모든 프로세스 제어 구조체 배열
+extern char __kernel_base[];
 
 struct process *create_process(uint32_t pc) {
     // 미사용(UNUSED) 상태의 프로세스 구조체 찾기
@@ -134,10 +158,17 @@ struct process *create_process(uint32_t pc) {
     *--sp = 0;                      // s0
     *--sp = (uint32_t) pc;          // ra (처음 실행 시 점프할 주소)
 
+    // Map kernel pages.
+    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+    for (paddr_t paddr = (paddr_t) __kernel_base;
+          paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+
     // 구조체 필드 초기화
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
     proc->sp = (uint32_t) sp;
+    proc->page_table = page_table;
     return proc;
 }
 
@@ -253,9 +284,13 @@ void yield(void) {
         return;
 
     __asm__ __volatile__(
+        "sfence.vma\n"
+        "csrw satp, %[satp]\n"
+        "sfence.vma\n"
         "csrw sscratch, %[sscratch]\n"
         :
-        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
+          [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
     );
 
     // 컨텍스트 스위칭
